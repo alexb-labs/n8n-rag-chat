@@ -1,0 +1,24 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Credentials and keys
+secrets/
+*.key
+*.pem
+*.asc
+*.gpg
+
+# Database backups
+*.dump
+*.backup
+*.sql.gz
+
+# Archives
+*.tar
+*.tar.gz
+*.zip
+
+# Logs
+*.log

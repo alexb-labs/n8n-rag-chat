@@ -167,6 +167,14 @@ Bis zu vier ältere Nachrichten werden anhand ihrer inhaltlichen Ähnlichkeit un
 
 Diese Kombination soll verhindern, dass ausschließlich die letzten Nachrichten berücksichtigt werden. Gleichzeitig wird nicht der gesamte gespeicherte Verlauf bei jeder Anfrage an das Sprachmodell übertragen.
 
+## Workflow-Datei
+
+Eine für die öffentliche Darstellung bereinigte Version des n8n-Workflows befindet sich unter:
+
+[`workflow/rag-chat.example.json`](workflow/rag-chat.example.json)
+
+Die Datei enthält keine Zugangsdaten oder produktionsspezifischen Identifikatoren. Nach dem Import müssen eigene PostgreSQL- und OpenRouter-Zugangsdaten zugewiesen werden. Der importierte Workflow ist standardmäßig nicht veröffentlicht und kann manuell getestet werden.
+
 ## Datenschutz und externe Verarbeitung
 
 Gesprächsinhalte und Embeddings werden in der eigenen PostgreSQL-Datenbank gespeichert.
@@ -189,6 +197,18 @@ Ein verschlüsseltes Backup wurde in einer getrennten PostgreSQL-Testumgebung wi
 - Anzahl und Dimension gespeicherter Embeddings
 
 Der vollständige Ablauf ist im [Restore-Test der Infrastruktur](https://github.com/alexb-labs/self-hosted-linux-infrastructure/blob/main/docs/restore-test.md) dokumentiert.
+
+## Test des Workflow-Beispiels
+
+Die bereinigte JSON-Datei wurde als neuer Workflow in n8n importiert.
+Nach der Zuweisung vorhandener PostgreSQL- und OpenRouter-Zugangsdaten
+wurde ein manueller Testlauf erfolgreich abgeschlossen.
+
+![Erfolgreicher Testlauf mit Chat-Antwort](docs/images/workflow-test.png)
+
+Alle 15 Nodes wurden erfolgreich ausgeführt und eine Antwort im Chat
+ausgegeben. Dieser Test bestätigt den technischen Ablauf; die Qualität
+des semantischen Abrufs wurde damit noch nicht bewertet.
 
 ## Bekannte Einschränkungen
 

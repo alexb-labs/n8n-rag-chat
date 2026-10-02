@@ -1,0 +1,481 @@
+{
+  "name": "RAG Chat Example - n8n and PostgreSQL pgvector",
+  "nodes": [
+    {
+      "parameters": {
+        "availableInChat": true,
+        "agentName": "PostgreSQL RAG Chat",
+        "agentDescription": "Session-based chat with persistent PostgreSQL history and semantic recall using pgvector.",
+        "options": {
+          "allowFileUploads": false,
+          "responseMode": "responseNodes"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -240,
+        -112
+      ],
+      "id": "e4756343-7cdb-4019-8257-fa8fa30dbc60",
+      "name": "New Message"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id\nFROM threads\nWHERE session_key = $1\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ $node[\"New Message\"].json.sessionId }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        -112
+      ],
+      "id": "76216723-02c7-45c8-ba3a-349e9369e5ec",
+      "name": "Fetch Thread ID",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (thread_id, role, content, embedding)\nVALUES ($1::uuid, $2, $3, $4::vector);",
+        "options": {
+          "queryReplacement": "={{ [\n  $node[\"Fetch Thread ID\"].json[\"id\"],\n  \"user\",\n  $node[\"New Message\"].json.chatInput,\n $json.skipEmbedding\n      ? null\n      : $node[\"Embed User\"].json.data[0].embedding\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        880,
+        -112
+      ],
+      "id": "13d91d92-69fc-4ffd-8880-33917d823e6e",
+      "name": "Insert User Message",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT role, content, created_at\nFROM messages\nWHERE thread_id = $1::uuid\nORDER BY created_at DESC\nLIMIT 7;",
+        "options": {
+          "queryReplacement": "={{ $node[\"Fetch Thread ID\"].json[\"id\"] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1328,
+        -112
+      ],
+      "id": "6c5b634c-1560-4cf1-87b3-892430afcbbe",
+      "name": "Load Chat History",
+      "alwaysOutputData": false,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openRouterApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"minimax/minimax-m2.5\",\n  \"messages\": {{ JSON.stringify($json.messages) }}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        240,
+        160
+      ],
+      "id": "fecd8348-b569-41ac-9373-c8b709d4ac18",
+      "name": "Openrouter Chat"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO threads (id, session_key, topic)\nVALUES (\ngen_random_uuid(),\n$1,\n'chat'\n)\nON CONFLICT (session_key) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ $json.sessionId }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        16,
+        -112
+      ],
+      "id": "1cff4fdf-e302-4d9b-b7b1-947c9276b6c0",
+      "name": "Insert Thread",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "message": "={{ $node[\"Openrouter Chat\"].json[\"choices\"][0][\"message\"][\"content\"] }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chat",
+      "typeVersion": 1.2,
+      "position": [
+        1328,
+        160
+      ],
+      "id": "84aee005-4df4-499c-be6c-960892bdf276",
+      "name": "Chat"
+    },
+    {
+      "parameters": {
+        "jsCode": "const systemPrompt = `\nYou are a helpful assistant. Use the supplied past context only when it is relevant to the current request. If the available context is insufficient, say so rather than inventing details.\n`;\n\n//\n// 1. Get chronological messages\n//\nlet chronological = $items(\"Load Chat History\").map(i => i.json);\n\n// Sort to oldest → newest\nchronological.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));\n\n//\n// 2. Get semantic messages\n//\nlet semantic = $items(\"Semantic Recall\").map(i => i.json);\n\n//\n// 2a. Exclude the latest user message from semantic messages\n//\n//const latestUserContent = $node[\"New Message\"].json.chatInput;\n//semantic = semantic.filter(\n//  m => !(m.role === \"user\" && m.content === latestUserContent)\n//);\n\n//\n// 3. Remove semantic messages that already exist in chronological\n//\nconst chronoSet = new Set(\n  chronological.map(m => m.role + \"|\" + m.content)\n);\n\nsemantic = semantic.filter(\n  m => !chronoSet.has(m.role + \"|\" + m.content)\n);\n\n//\n// 4. Sort semantic by created_at (oldest first for stability)\n//\nsemantic.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));\n\n//\n// 5. Deduplicate semantic + chronological internally\n//\nconst unique = new Map();\n[...semantic, ...chronological].forEach(msg => {\n  const key = msg.role + \"|\" + msg.content;\n  if (!unique.has(key)) unique.set(key, msg);\n});\n\n//\n// 6. Final message array: system prompt → semantic → chronological\n//\nconst messages = [\n  { role: \"system\", content: systemPrompt },\n\n  { role: \"system\", content: \"Relevant past context:\" },\n  ...semantic.map(m => ({ role: m.role, content: m.content })),\n\n  { role: \"system\", content: \"Current conversation:\" },\n  ...chronological.map(m => ({ role: m.role, content: m.content }))\n];\n\nreturn [{ json: { messages } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        16,
+        160
+      ],
+      "id": "821cb1bf-6116-4bd4-96e8-57c5a2fc4d49",
+      "name": "System Prompt + Array"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (thread_id, role, content, embedding)\nVALUES ($1::uuid, $2, $3, $4::vector);",
+        "options": {
+          "queryReplacement": "={{ [\n  $node[\"Fetch Thread ID\"].json[\"id\"],\n  \"assistant\",\n  $node[\"Openrouter Chat\"].json.choices[0].message.content,\n$json.skipEmbedding\n      ? null\n      : $node[\"Embed Assistant\"].json.data[0].embedding\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1120,
+        160
+      ],
+      "id": "f7cab512-a612-4feb-ab09-4927bba6795e",
+      "name": "Insert Assistant Reply",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openRouterApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "openai/text-embedding-3-small"
+            },
+            {
+              "name": "input",
+              "value": "={{ $node['New Message'].json.chatInput }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        464,
+        -112
+      ],
+      "id": "3d90bf94-b2bd-4a4a-8a15-c73bc58653b4",
+      "name": "Embed User"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH scored AS (\n  SELECT\n    role,\n    content,\n    created_at,\n\n    -- cosine similarity\n    1 - (embedding <=> $2::vector) AS similarity,\n\n    -- recency decay (30 day window)\n    GREATEST(\n      0,\n      1 - (EXTRACT(EPOCH FROM (NOW() - created_at)) / (60*60*24*30))\n    ) AS recency_score\n\n  FROM messages\n  WHERE thread_id = $1::uuid\n    AND content <> $3\n  AND embedding IS NOT NULL\n)\n\nSELECT\n  role,\n  content,\n  created_at\nFROM scored\nWHERE similarity >= 0.65\nORDER BY (similarity + (0.15 * recency_score)) DESC\nLIMIT 4;",
+        "options": {
+          "queryReplacement": "={{ [\n  $node[\"Fetch Thread ID\"].json[\"id\"],\n  JSON.stringify($node[\"Embed User\"].json[\"data\"][0][\"embedding\"]),\n  $node[\"New Message\"].json.chatInput\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1120,
+        -112
+      ],
+      "id": "874511c9-186a-42dd-9388-f925574f4543",
+      "name": "Semantic Recall",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openRouterApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "openai/text-embedding-3-small"
+            },
+            {
+              "name": "input",
+              "value": "={{$json[\"choices\"][0][\"message\"][\"content\"]}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        656,
+        160
+      ],
+      "id": "94fdbc2f-f640-4f37-8f10-ecd26befd2c1",
+      "name": "Embed Assistant"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $node[\"New Message\"].json.chatInput || \"\";\nconst content = raw.trim().toLowerCase();\n\nconst ignorePhrases = [\n  \"thanks\",\n  \"thank you\",\n  \"ok\",\n  \"okay\",\n  \"sounds good\",\n  \"great\",\n  \"perfect\",\n  \"got it\",\n  \"understood\",\n  \"cool\",\n  \"nice\",\n  \"alright\",\n  \"makes sense\"\n];\n\nconst wordCount = content.split(/\\s+/).filter(Boolean).length;\nconst charCount = content.length;\n\nconst isGeneric = ignorePhrases.includes(content);\n\nconst shouldStore =\n  charCount >= 20 &&\n  wordCount >= 4 &&\n  !isGeneric;\n\nreturn [{\n  json: {\n    skipEmbedding: !shouldStore   // BOOLEAN\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        -112
+      ],
+      "id": "cfec5d74-544a-4659-992c-489859d6023d",
+      "name": "Filter Junk",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const choice = $json.choices?.[0];\n\nif (\n  !choice ||\n  choice.error ||\n  !choice.message ||\n  !choice.message.content ||\n  choice.message.content.trim() === \"\"\n) {\n  throw new Error(\"Upstream model failed to generate output\");\n}\n\nreturn $input.all();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        160
+      ],
+      "id": "b42d9fc4-6550-48a3-b8ef-4da8cf2e396a",
+      "name": "Error Handling"
+    },
+    {
+      "parameters": {
+        "jsCode": "const content = $node[\"Openrouter Chat\"].json.choices[0].message.content?.trim() || \"\";\n\nconst ignorePhrases = [\n  \"hi\",\n  \"hello\",\n  \"ok\",\n  \"okay\",\n  \"thanks\",\n  \"thank you\",\n  \"you're welcome\"\n];\n\nconst wordCount = content.split(/\\s+/).length;\nconst charCount = content.length;\n\nconst isGeneric = ignorePhrases.includes(content.toLowerCase());\n\nconst shouldStore =\n  charCount >= 40 &&\n  wordCount >= 6 &&\n  !isGeneric;\n\nreturn [{\n  json: {\n    skipEmbedding: !shouldStore\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        160
+      ],
+      "id": "a005ca99-d4fc-4407-988b-7f3fe00daa3c",
+      "name": "Filter Junk From Assistant",
+      "alwaysOutputData": false
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "New Message": {
+      "main": [
+        [
+          {
+            "node": "Insert Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Thread ID": {
+      "main": [
+        [
+          {
+            "node": "Embed User",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert User Message": {
+      "main": [
+        [
+          {
+            "node": "Semantic Recall",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Chat History": {
+      "main": [
+        [
+          {
+            "node": "System Prompt + Array",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Openrouter Chat": {
+      "main": [
+        [
+          {
+            "node": "Error Handling",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Thread": {
+      "main": [
+        [
+          {
+            "node": "Fetch Thread ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "System Prompt + Array": {
+      "main": [
+        [
+          {
+            "node": "Openrouter Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Assistant Reply": {
+      "main": [
+        [
+          {
+            "node": "Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed User": {
+      "main": [
+        [
+          {
+            "node": "Filter Junk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Semantic Recall": {
+      "main": [
+        [
+          {
+            "node": "Load Chat History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Assistant": {
+      "main": [
+        [
+          {
+            "node": "Filter Junk From Assistant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Junk": {
+      "main": [
+        [
+          {
+            "node": "Insert User Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Handling": {
+      "main": [
+        [
+          {
+            "node": "Embed Assistant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Junk From Assistant": {
+      "main": [
+        [
+          {
+            "node": "Insert Assistant Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": []
+}
